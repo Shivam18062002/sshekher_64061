@@ -1,0 +1,630 @@
+---
+title: "Assignment 1: Neural Networks — IMDB Sentiment Classification"
+author: "Shivam Shekher"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    highlight: tango
+fontsize: 11pt
+geometry: margin=0.9in
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{table}{H}
+  - \usepackage{booktabs}
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+---
+
+```{r knitr-options, include = FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  comment    = "#>",
+  fig.align  = "center",
+  fig.pos    = "H",
+  fig.width  = 8,
+  fig.height = 5,
+  out.width  = "95%"
+)
+options(knitr.table.format = "latex")
+```
+
+# Overview
+
+This report extends the IMDB sentiment-classification network from class. The
+baseline is a fully connected network with two hidden layers of 16 ReLU units,
+a sigmoid output, RMSprop, and binary crossentropy. Starting from that
+baseline, one factor is changed at a time so that every difference in
+performance can be attributed to that factor.
+
+| Assignment question | What is changed | Models compared |
+|:--|:--|:--|
+| 1. Number of hidden layers | 1, 2, 3 hidden layers | 1x16, 2x16, 3x16 |
+| 2. Number of hidden units | 8, 16, 32, 64 units per layer | 2x8, 2x16, 2x32, 2x64 |
+| 3. Loss function | MSE instead of binary crossentropy | 2x16 BCE vs 2x16 MSE |
+| 4. Activation function | tanh instead of ReLU | 16 and 32 units, ReLU vs tanh |
+| 5. Improving validation | Dropout, L2 regularization, both | 16, 32 and 64 units |
+
+**Evaluation protocol.** Every model is trained for 20 epochs on 15,000
+reviews and monitored on a 10,000-review validation set. For each model the
+report records the best validation accuracy and the epoch it occurred at. The
+weights from that best epoch are restored and scored on the 25,000-review test
+set, so test accuracy reflects the model at its best point rather than after
+it has overfit. The final model is chosen on validation accuracy only; the
+test set is never used for selection.
+
+# Setup
+
+```{r setup}
+library(keras3)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(ggplot2)
+library(scales)
+
+SEED              <- 64061L
+NUM_WORDS         <- 10000L   # vocabulary size
+VALIDATION_N      <- 10000L   # reviews held out for validation
+BATCH_SIZE        <- 512L
+EXPERIMENT_EPOCHS <- 20L
+
+set.seed(SEED)
+dir.create("results", showWarnings = FALSE)
+```
+
+# Data
+
+## Loading the IMDB dataset
+
+```{r load-data}
+imdb <- dataset_imdb(num_words = NUM_WORDS)
+
+train_data   <- imdb$train$x
+train_labels <- as.numeric(imdb$train$y)
+test_data    <- imdb$test$x
+test_labels  <- as.numeric(imdb$test$y)
+
+cat("Training reviews:", length(train_data), "\n")
+cat("Test reviews:    ", length(test_data), "\n")
+```
+
+## Preprocessing
+
+Each review is a sequence of word indices. It is converted into a multi-hot
+vector of length 10,000, where position *j* is 1 if word *j* appears in the
+review. The first 10,000 training reviews form the validation set and the
+remaining 15,000 are used for training during the experiments.
+
+**Memory.** Stored as ordinary R numbers (8 bytes each), the four matrices
+would take about 6 GB, and each call to `fit()` would convert them into new
+Python arrays again. To avoid that, the matrices are built once, directly as
+32-bit NumPy arrays (about 2 GB in total). The validation and training splits
+are views of the full training array, not copies, and the same arrays are
+reused by every model.
+
+```{r preprocessing}
+# Small Python helpers: build a multi-hot matrix and split rows without copying
+reticulate::py_run_string("
+import numpy as np
+
+def multi_hot(rows, cols, n_rows, dim):
+    x = np.zeros((int(n_rows), int(dim)), dtype='float32')
+    x[np.asarray(rows, dtype='int64'), np.asarray(cols, dtype='int64')] = 1.0
+    return x
+
+def head_rows(x, n):
+    return x[:int(n)]
+
+def tail_rows(x, n):
+    return x[int(n):]
+")
+py_main <- reticulate::import_main(convert = FALSE)  # keep results in Python
+
+vectorize_sequences <- function(sequences, dimension = NUM_WORDS) {
+  rows <- rep(seq_along(sequences) - 1L, lengths(sequences))  # 0-based rows
+  cols <- unlist(sequences, use.names = FALSE) - 1L          # word j -> col j-1
+  keep <- cols >= 0L & cols < dimension
+  py_main$multi_hot(rows[keep], cols[keep], length(sequences), dimension)
+}
+
+x_train_full <- vectorize_sequences(train_data)
+x_test       <- vectorize_sequences(test_data)
+y_train_full <- train_labels
+y_test       <- test_labels
+
+x_val           <- py_main$head_rows(x_train_full, VALIDATION_N)
+partial_x_train <- py_main$tail_rows(x_train_full, VALIDATION_N)
+val_idx         <- seq_len(VALIDATION_N)
+y_val           <- y_train_full[val_idx]
+partial_y_train <- y_train_full[-val_idx]
+
+rm(imdb, train_data, test_data)
+invisible(gc())
+
+print(x_train_full$shape)
+print(x_test$shape)
+```
+
+## Dataset summary
+
+```{r dataset-summary}
+dataset_summary <- tibble(
+  Split           = c("Training", "Validation", "Test"),
+  Reviews         = c(length(partial_y_train), length(y_val), length(y_test)),
+  Features        = NUM_WORDS,
+  `Positive rate` = c(mean(partial_y_train), mean(y_val), mean(y_test))
+)
+write_csv(dataset_summary, "results/dataset_summary.csv")
+
+dataset_summary |>
+  mutate(`Positive rate` = percent(`Positive rate`, accuracy = 0.1)) |>
+  knitr::kable(caption = "Size and class balance of each split",
+               booktabs = TRUE, format.args = list(big.mark = ","))
+```
+
+All three splits are close to 50% positive, so accuracy is a fair metric and
+a model that always predicts one class would score about 50%.
+
+# Model and Experiment Functions
+
+## Model builder
+
+`build_imdb_model()` builds the class architecture and exposes each factor
+the assignment asks about as an argument. When dropout is used, a dropout
+layer follows every hidden layer; when L2 is used, it is applied to every
+hidden layer's weights.
+
+```{r model-function}
+build_imdb_model <- function(hidden_layers = 2L,
+                             units         = 16L,
+                             activation    = "relu",
+                             loss_function = "binary_crossentropy",
+                             dropout_rate  = 0,
+                             l2            = 0) {
+  model <- keras_model_sequential(input_shape = NUM_WORDS)
+
+  for (i in seq_len(hidden_layers)) {
+    model <- model |>
+      layer_dense(
+        units              = units,
+        activation         = activation,
+        kernel_regularizer = if (l2 > 0) regularizer_l2(l2) else NULL
+      )
+    if (dropout_rate > 0) {
+      model <- model |> layer_dropout(rate = dropout_rate)
+    }
+  }
+
+  model <- model |> layer_dense(units = 1, activation = "sigmoid")
+
+  model |> compile(
+    optimizer = optimizer_rmsprop(),
+    loss      = loss_function,
+    metrics   = "accuracy"
+  )
+  model
+}
+```
+
+## Experiment runner
+
+`run_experiment()` trains one configuration and returns its per-epoch history
+and a one-row summary. A checkpoint callback saves the weights from the epoch
+with the highest validation accuracy, and those weights are restored before
+the test-set evaluation.
+
+```{r experiment-function}
+run_experiment <- function(id, label, group, hidden_layers, units,
+                           activation, loss_function, dropout_rate, l2) {
+  set_random_seed(SEED)   # same initial conditions for every model
+
+  model <- build_imdb_model(hidden_layers, units, activation,
+                            loss_function, dropout_rate, l2)
+
+  checkpoint_path <- file.path(tempdir(), paste0(id, ".weights.h5"))
+
+  history <- model |> fit(
+    partial_x_train, partial_y_train,
+    epochs          = EXPERIMENT_EPOCHS,
+    batch_size      = BATCH_SIZE,
+    validation_data = list(x_val, y_val),
+    callbacks       = list(callback_model_checkpoint(
+      filepath          = checkpoint_path,
+      monitor           = "val_accuracy",
+      save_best_only    = TRUE,
+      save_weights_only = TRUE
+    )),
+    verbose = 0
+  )
+
+  # keras3's fit() returns an R object; per-epoch values are in $metrics
+  m <- lapply(history$metrics, function(v) as.numeric(unlist(v)))
+  stopifnot(length(m$val_accuracy) == EXPERIMENT_EPOCHS)
+
+  history_df <- tibble(
+    id             = id,
+    epoch          = seq_along(m$accuracy),
+    train_accuracy = m$accuracy,
+    val_accuracy   = m$val_accuracy,
+    train_loss     = m$loss,
+    val_loss       = m$val_loss
+  )
+  write_csv(history_df, file.path("results", paste0("history_", id, ".csv")))
+
+  test_last <- model |> evaluate(x_test, y_test, verbose = 0)
+  model |> load_model_weights(checkpoint_path)
+  test_best <- model |> evaluate(x_test, y_test, verbose = 0)
+
+  best_epoch <- which.max(m$val_accuracy)
+
+  summary_row <- tibble(
+    id, label, group, hidden_layers, units, activation,
+    loss_function, dropout_rate, l2,
+    best_epoch,
+    best_val_accuracy  = m$val_accuracy[best_epoch],
+    last_val_accuracy  = tail(m$val_accuracy, 1),
+    overfit_gap        = tail(m$accuracy, 1) - tail(m$val_accuracy, 1),
+    test_accuracy_best = as.numeric(test_best[["accuracy"]]),
+    test_accuracy_last = as.numeric(test_last[["accuracy"]])
+  )
+  stopifnot(nrow(summary_row) == 1)
+
+  list(summary = summary_row, history = history_df)
+}
+```
+
+# Running the Experiments
+
+```{r experiment-grid}
+experiment_grid <- tribble(
+  ~id,                ~label,                       ~group,
+  ~hidden_layers, ~units, ~activation, ~loss_function, ~dropout_rate, ~l2,
+  "base_2x16",        "2x16 ReLU, BCE (baseline)",  "Baseline",
+  2L, 16L, "relu", "binary_crossentropy", 0,   0,
+  "depth_1x16",       "1x16 ReLU, BCE",             "Depth",
+  1L, 16L, "relu", "binary_crossentropy", 0,   0,
+  "depth_3x16",       "3x16 ReLU, BCE",             "Depth",
+  3L, 16L, "relu", "binary_crossentropy", 0,   0,
+  "width_2x8",        "2x8 ReLU, BCE",              "Width",
+  2L,  8L, "relu", "binary_crossentropy", 0,   0,
+  "width_2x32",       "2x32 ReLU, BCE",             "Width",
+  2L, 32L, "relu", "binary_crossentropy", 0,   0,
+  "width_2x64",       "2x64 ReLU, BCE",             "Width",
+  2L, 64L, "relu", "binary_crossentropy", 0,   0,
+  "loss_mse_2x16",    "2x16 ReLU, MSE",             "Loss",
+  2L, 16L, "relu", "mse",                 0,   0,
+  "act_tanh_2x16",    "2x16 tanh, BCE",             "Activation",
+  2L, 16L, "tanh", "binary_crossentropy", 0,   0,
+  "act_tanh_2x32",    "2x32 tanh, BCE",             "Activation",
+  2L, 32L, "tanh", "binary_crossentropy", 0,   0,
+  "reg_drop_2x16",    "2x16 ReLU, dropout 0.5",     "Regularization",
+  2L, 16L, "relu", "binary_crossentropy", 0.5, 0,
+  "reg_l2_2x16",      "2x16 ReLU, L2 0.001",        "Regularization",
+  2L, 16L, "relu", "binary_crossentropy", 0,   0.001,
+  "reg_drop_2x32",    "2x32 ReLU, dropout 0.5",     "Regularization",
+  2L, 32L, "relu", "binary_crossentropy", 0.5, 0,
+  "reg_drop_2x64",    "2x64 ReLU, dropout 0.5",     "Regularization",
+  2L, 64L, "relu", "binary_crossentropy", 0.5, 0,
+  "reg_drop_l2_2x64", "2x64 ReLU, dropout 0.5 + L2", "Regularization",
+  2L, 64L, "relu", "binary_crossentropy", 0.5, 0.001
+)
+
+runs <- lapply(seq_len(nrow(experiment_grid)), function(i) {
+  do.call(run_experiment, as.list(experiment_grid[i, ]))
+})
+
+results_summary <- bind_rows(lapply(runs, `[[`, "summary"))
+histories       <- bind_rows(lapply(runs, `[[`, "history")) |>
+  left_join(select(results_summary, id, label), by = "id")
+
+write_csv(results_summary, "results/results_summary.csv")
+write_csv(histories, "results/all_histories.csv")
+
+cat("Experiments completed:", nrow(results_summary), "of",
+    nrow(experiment_grid), "\n")
+```
+
+```{r helpers, include = FALSE}
+pct <- function(x, acc = 0.01) percent(x, accuracy = acc)
+
+# Comparison table for a set of experiment ids, in the order given
+results_table <- function(ids, caption) {
+  results_summary |>
+    filter(id %in% ids) |>
+    arrange(match(id, ids)) |>
+    transmute(
+      Model           = label,
+      `Best ep.`      = best_epoch,
+      `Val. (best)`   = pct(best_val_accuracy),
+      `Test (best)`   = pct(test_accuracy_best),
+      `Test (ep. 20)` = pct(test_accuracy_last),
+      `Gap (ep. 20)`  = pct(overfit_gap)
+    ) |>
+    knitr::kable(caption = caption, booktabs = TRUE, linesep = "",
+                 align = "lrrrrr")
+}
+
+# Training/validation curves for a set of experiment ids
+plot_curves <- function(ids, title) {
+  histories |>
+    filter(id %in% ids) |>
+    mutate(label = factor(label, levels = results_summary$label[
+      match(ids, results_summary$id)])) |>
+    pivot_longer(c(train_accuracy, val_accuracy, train_loss, val_loss),
+                 names_to = c("split", "metric"), names_sep = "_") |>
+    mutate(panel = factor(
+      paste(ifelse(split == "train", "Training", "Validation"),
+            ifelse(metric == "accuracy", "accuracy", "loss")),
+      levels = c("Training accuracy", "Validation accuracy",
+                 "Training loss", "Validation loss"))) |>
+    ggplot(aes(epoch, value, colour = label)) +
+    geom_line(linewidth = 0.8) +
+    facet_wrap(~ panel, ncol = 2, scales = "free_y") +
+    scale_colour_brewer(palette = "Dark2") +
+    labs(title = title, x = "Epoch", y = NULL, colour = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "bottom") +
+    guides(colour = guide_legend(ncol = 2))
+}
+
+delta_pp <- function(x) sprintf("%+.2f pp", 100 * x)
+```
+
+The tables in the next five sections use these columns:
+
+* **Best ep.** and **Val. (best)**: the epoch with the highest validation
+  accuracy, and that accuracy.
+* **Test (best)**: test accuracy using the weights from the best epoch.
+* **Test (ep. 20)**: test accuracy after all 20 epochs, which shows the cost
+  of overtraining.
+* **Gap (ep. 20)**: training accuracy minus validation accuracy at epoch 20.
+  Larger values mean more overfitting.
+
+# Number of Hidden Layers (Question 1)
+
+```{r depth-table}
+depth_ids <- c("depth_1x16", "base_2x16", "depth_3x16")
+results_table(depth_ids, "Effect of the number of hidden layers (16 units)")
+```
+
+```{r depth-plot, fig.cap = "Training and validation curves for 1, 2 and 3 hidden layers."}
+plot_curves(depth_ids, "Hidden-layer depth")
+```
+
+# Number of Hidden Units (Question 2)
+
+```{r units-table}
+units_ids <- c("width_2x8", "base_2x16", "width_2x32", "width_2x64")
+results_table(units_ids, "Effect of the number of units per layer (2 layers)")
+```
+
+```{r units-plot, fig.cap = "Training and validation curves for 8, 16, 32 and 64 units per layer."}
+plot_curves(units_ids, "Hidden units per layer")
+```
+
+# MSE versus Binary Crossentropy (Question 3)
+
+```{r loss-table}
+loss_ids <- c("base_2x16", "loss_mse_2x16")
+results_table(loss_ids, "Binary crossentropy versus mean squared error")
+```
+
+```{r loss-plot, fig.cap = "Training and validation curves for BCE and MSE. The loss panels are on different scales, so compare accuracy rather than loss values."}
+plot_curves(loss_ids, "Loss function")
+```
+
+# tanh versus ReLU (Question 4)
+
+```{r activation-table}
+activation_ids <- c("base_2x16", "act_tanh_2x16", "width_2x32", "act_tanh_2x32")
+results_table(activation_ids, "ReLU versus tanh at 16 and 32 units")
+```
+
+```{r activation-plot, fig.cap = "Training and validation curves for ReLU and tanh."}
+plot_curves(activation_ids, "Activation function")
+```
+
+# Regularization to Improve Validation (Question 5)
+
+Dropout randomly sets 50% of hidden activations to zero during training, and
+L2 regularization penalizes large weights. Both limit how closely the network
+can memorize the training reviews.
+
+```{r reg-table}
+reg_ids <- c("base_2x16", "reg_drop_2x16", "reg_l2_2x16",
+             "reg_drop_2x32", "width_2x64", "reg_drop_2x64",
+             "reg_drop_l2_2x64")
+results_table(reg_ids, "Effect of dropout and L2 regularization")
+```
+
+```{r reg-plot, fig.cap = "Training and validation curves with and without regularization.", fig.height = 5.5}
+plot_curves(reg_ids, "Regularization")
+```
+
+# Summary of All Experiments
+
+```{r summary-table}
+results_summary |>
+  arrange(desc(best_val_accuracy)) |>
+  transmute(
+    Rank                = row_number(),
+    Model               = label,
+    Group               = group,
+    `Best epoch`        = best_epoch,
+    `Val. acc. (best)`  = pct(best_val_accuracy),
+    `Test acc. (best)`  = pct(test_accuracy_best)
+  ) |>
+  knitr::kable(caption = "All experiments ranked by best validation accuracy",
+               booktabs = TRUE, linesep = "", align = "rllrrr")
+```
+
+```{r summary-plot, fig.cap = "Best validation accuracy and matching test accuracy for every model. The dashed line marks the baseline's validation accuracy.", fig.height = 6}
+baseline_val <- results_summary$best_val_accuracy[results_summary$id == "base_2x16"]
+
+results_summary |>
+  mutate(label = reorder(label, best_val_accuracy)) |>
+  pivot_longer(c(best_val_accuracy, test_accuracy_best),
+               names_to = "metric", values_to = "accuracy") |>
+  mutate(metric = ifelse(metric == "best_val_accuracy",
+                         "Validation (best epoch)", "Test (best-epoch weights)")) |>
+  ggplot(aes(accuracy, label)) +
+  geom_vline(xintercept = baseline_val, linetype = "dashed", colour = "grey50") +
+  geom_line(aes(group = label), colour = "grey75") +
+  geom_point(aes(colour = group, shape = metric), size = 3) +
+  scale_x_continuous(labels = percent_format(accuracy = 0.1)) +
+  scale_shape_manual(values = c(17, 16)) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(title = "IMDB hyperparameter experiments",
+       x = "Accuracy", y = NULL, colour = "Group", shape = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom", legend.box = "vertical")
+```
+
+# Final Model
+
+The configuration with the highest validation accuracy is retrained on all
+25,000 training reviews for the number of epochs at which it peaked, then
+evaluated once on the test set.
+
+```{r final-model}
+selected <- results_summary |>
+  slice_max(best_val_accuracy, n = 1, with_ties = FALSE)
+baseline <- results_summary |> filter(id == "base_2x16")
+
+set_random_seed(SEED)
+final_model <- build_imdb_model(
+  hidden_layers = selected$hidden_layers,
+  units         = selected$units,
+  activation    = selected$activation,
+  loss_function = selected$loss_function,
+  dropout_rate  = selected$dropout_rate,
+  l2            = selected$l2
+)
+
+final_history <- final_model |> fit(
+  x_train_full, y_train_full,
+  epochs     = selected$best_epoch,
+  batch_size = BATCH_SIZE,
+  verbose    = 0
+)
+
+final_test     <- final_model |> evaluate(x_test, y_test, verbose = 0)
+final_test_acc <- as.numeric(final_test[["accuracy"]])
+
+final_results <- tibble(
+  Run                     = c("Selected model, final",
+                              "Baseline, experiment run"),
+  Model                   = c(selected$label, baseline$label),
+  `Training epochs`       = c(selected$best_epoch, baseline$best_epoch),
+  `Val. acc. (best)`      = c(selected$best_val_accuracy,
+                              baseline$best_val_accuracy),
+  `Test acc.`             = c(final_test_acc, baseline$test_accuracy_best)
+)
+write_csv(final_results, "results/final_model_results.csv")
+
+final_results |>
+  mutate(across(c(`Val. acc. (best)`, `Test acc.`), pct)) |>
+  knitr::kable(
+    caption = "Final model (retrained on all 25,000 reviews) versus baseline",
+    booktabs = TRUE, align = "llrrr")
+```
+
+The baseline row shows its test accuracy from the experiment run (trained on
+15,000 reviews, best-epoch weights) for reference.
+
+# Conclusions
+
+```{r conclusions, echo = FALSE, results = "asis"}
+get <- function(i) results_summary[results_summary$id == i, ]
+d   <- function(i) get(i)$best_val_accuracy - baseline$best_val_accuracy
+
+verdict <- function(x) {
+  if (abs(x) < 0.005) "essentially no change (within run-to-run noise)"
+  else if (x > 0) "an improvement" else "a drop"
+}
+
+depth_best <- results_summary |> filter(id %in% depth_ids) |>
+  slice_max(best_val_accuracy, n = 1, with_ties = FALSE)
+units_best <- results_summary |> filter(id %in% units_ids) |>
+  slice_max(best_val_accuracy, n = 1, with_ties = FALSE)
+unreg_best <- results_summary |> filter(dropout_rate == 0, l2 == 0) |>
+  slice_max(best_val_accuracy, n = 1, with_ties = FALSE)
+reg_best   <- results_summary |> filter(dropout_rate > 0 | l2 > 0) |>
+  slice_max(best_val_accuracy, n = 1, with_ties = FALSE)
+
+unreg_models <- results_summary |> filter(dropout_rate == 0, l2 == 0)
+delta_range  <- sprintf("%.1f-percentage-point",
+                        100 * diff(range(unreg_models$best_val_accuracy)))
+
+cat(
+  "* **Hidden layers.** Relative to the two-layer baseline (",
+  pct(baseline$best_val_accuracy), " validation), one layer gave ",
+  delta_pp(d("depth_1x16")), " (", verdict(d("depth_1x16")), ") and three ",
+  "layers gave ", delta_pp(d("depth_3x16")), " (",
+  verdict(d("depth_3x16")), "). The best depth was **", depth_best$label,
+  "**. The three-layer network peaked at epoch ",
+  get("depth_3x16")$best_epoch, " versus epoch ",
+  get("depth_1x16")$best_epoch, " for one layer",
+  if (depth_best$id == "depth_3x16") "." else
+    ", so the extra capacity mainly speeds up overfitting.",
+  "\n\n",
+
+  "* **Hidden units.** The best width was **", units_best$label, "** (",
+  pct(units_best$best_val_accuracy), "). The epoch-20 overfit gap was ",
+  pct(get("width_2x8")$overfit_gap), " with 8 units and ",
+  pct(get("width_2x64")$overfit_gap), " with 64 units",
+  if (get("width_2x64")$overfit_gap > get("width_2x8")$overfit_gap)
+    ", so wider layers memorize the training set more." else ".",
+  "\n\n",
+
+  "* **Loss function.** MSE gave ", delta_pp(d("loss_mse_2x16")),
+  " validation accuracy versus binary crossentropy (",
+  verdict(d("loss_mse_2x16")), "). Binary crossentropy is the natural loss ",
+  "for a sigmoid output because it penalizes confident wrong predictions ",
+  "much more heavily.\n\n",
+
+  "* **Activation.** tanh gave ", delta_pp(d("act_tanh_2x16")),
+  " at 16 units and ",
+  delta_pp(get("act_tanh_2x32")$best_val_accuracy -
+           get("width_2x32")$best_val_accuracy),
+  " at 32 units, relative to ReLU at the same width.\n\n",
+
+  "* **Regularization.** The best regularized model (**", reg_best$label,
+  "**, ", pct(reg_best$best_val_accuracy), ") compares with ",
+  pct(unreg_best$best_val_accuracy), " for the best unregularized model (",
+  unreg_best$label, "), ",
+  delta_pp(reg_best$best_val_accuracy - unreg_best$best_val_accuracy),
+  ". For the 64-unit network, dropout changed the epoch-20 overfit gap ",
+  "from ", pct(get("width_2x64")$overfit_gap), " to ",
+  pct(get("reg_drop_2x64")$overfit_gap), ", and its test accuracy after 20 ",
+  "epochs was ", pct(get("reg_drop_2x64")$test_accuracy_last),
+  " versus ", pct(get("width_2x64")$test_accuracy_last),
+  " without dropout.\n\n",
+
+  "* **Final model.** **", selected$label, "** was selected on validation ",
+  "accuracy (", pct(selected$best_val_accuracy), "). Retrained on all ",
+  "25,000 reviews for ", selected$best_epoch, " epoch(s), it reached **",
+  pct(final_test_acc), "** test accuracy, compared with ",
+  pct(baseline$test_accuracy_best), " for the baseline.\n",
+  sep = ""
+)
+```
+
+**Overall story.** The curves show that the main challenge on this task is
+overfitting rather than a lack of capacity: the unregularized models reach
+their best validation accuracy early (between epochs
+`r min(unreg_models$best_epoch)` and `r max(unreg_models$best_epoch)`) and
+then decline while training accuracy keeps rising toward 100%. Across the
+architecture changes in Questions 1 to 4, best validation accuracy stayed
+within a `r delta_range` range. The two most useful tools are therefore
+stopping at the best epoch, which every model here uses for its test score,
+and regularization such as dropout, which slows the collapse of validation
+accuracy when a model is trained for longer than it needs.
